@@ -1,0 +1,12 @@
+dplyr
+tidyr
+ggplot2
+Matrix
+glmnet
+randomForest
+pROC
+lattice
+caret
+tibble
+knitr
+kableExtra
