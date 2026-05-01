@@ -1,0 +1,531 @@
+---
+title: "MIAC Baseball 2026 - Full Season Scraper"
+author: "Ben Trutwin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+
+This script scrapes all MIAC baseball data for the 2026 season end-to-end with no manual intervention:
+
+1. Scrapes the full composite schedule (all games, all months)
+2. Scrapes every box score for every completed game
+3. Scrapes team and individual cumulative stats from the MIAC stats page
+4. Cleans and merges all data into a unified dataset
+5. Saves all outputs as CSV files
+
+---
+
+## Libraries and Constants
+
+> **Note on `chromote`:** The MIAC calendar page renders its schedule table via JavaScript, so plain `rvest::read_html()` returns an empty shell with no game rows. `chromote` launches a headless Chrome browser from R, executes the JavaScript, and then hands the fully-rendered HTML back to `rvest` for parsing. You need Google Chrome installed; then run `install.packages("chromote")` once.
+
+```{r libraries-constants}
+library(rvest)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(janitor)
+library(chromote)   # headless Chrome for JavaScript-rendered pages
+
+BASE_URL     <- "https://miacathletics.com"
+CALENDAR_URL <- paste0(BASE_URL, "/calendar.aspx?path=baseball")
+STATS_URL    <- paste0(BASE_URL, "/stats.aspx?path=baseball&year=2026")
+YEAR         <- 2026
+```
+
+---
+
+## Function Definitions
+
+### `scrape_calendar_month()`
+
+Scrapes the MIAC baseball calendar for a given year and month using a headless Chrome browser (`chromote`) to execute the JavaScript that populates the schedule table before parsing. **Note:** The MIAC composite schedule is not actually paginated by month — every month URL returns the full season schedule (Feb–May 2026). This function exists for modularity and robustness.
+
+```{r fn-scrape-calendar-month}
+scrape_calendar_month <- function(year, month) {
+  url <- paste0(BASE_URL, "/calendar.aspx?path=baseball&year=", year, "&month=", month)
+
+  # Launch a headless Chrome session to execute JavaScript before parsing.
+  # The schedule table is populated by JS, so plain read_html() returns no rows.
+  html_content <- tryCatch({
+    b <- ChromoteSession$new()
+    on.exit(b$close(), add = TRUE)   # always close the session, even on error
+
+    b$Page$navigate(url, wait_ = FALSE)
+    b$Page$loadEventFired()          # wait for the initial page load
+    Sys.sleep(2)                     # extra buffer for JS table population
+
+    b$Runtime$evaluate('document.documentElement.outerHTML')$result$value
+  }, error = function(e) {
+    message("  [WARN] chromote failed for month ", month, ": ", e$message)
+    return(NULL)
+  })
+
+  if (is.null(html_content)) return(NULL)
+
+  page <- read_html(html_content)
+  extract_results_and_links(page)
+}
+```
+
+### `extract_results_and_links()`
+
+Parses the raw HTML of a calendar page to extract game rows. Each row contains: date, away team + score, home team + score, result, location, and box score URL. For cancelled/postponed games, scores are absent and no box score link exists.
+
+The MIAC schedule table structure per row:
+
+`| Date | AwayTeam Score | HomeTeam Score | Result | Location | BoxScore |`
+
+```{r fn-extract-results-and-links}
+extract_results_and_links <- function(page_html) {
+
+  rows <- page_html %>% html_nodes("table tbody tr")
+
+  if (length(rows) == 0) {
+    message("  [INFO] No table rows found on this page.")
+    return(tibble(
+      date = character(), away_raw = character(), home_raw = character(),
+      result = character(), location = character(), boxscore_url = character()
+    ))
+  }
+
+  row_data <- map(rows, function(r) {
+    cells <- r %>% html_nodes("td") %>% html_text(trim = TRUE)
+
+    if (length(cells) < 4) return(NULL)
+    if (all(cells == "" | cells == " ")) return(NULL)
+
+    hrefs    <- r %>% html_nodes("a") %>% html_attr("href")
+    bs_hrefs <- hrefs[str_detect(hrefs, regex("boxscore", ignore_case = TRUE))]
+
+    boxscore_url <- NA_character_
+    if (length(bs_hrefs) > 0) {
+      bs <- bs_hrefs[1]
+      boxscore_url <- ifelse(str_starts(bs, "http"), bs, paste0(BASE_URL, bs))
+    }
+
+    # cells[1] = date, cells[2] = away team+score, cells[3] = home team+score
+    # cells[4] = result (e.g. "Final 9 innings"), cells[5] = location
+    date_val     <- if (length(cells) >= 1) cells[1] else NA_character_
+    away_raw     <- if (length(cells) >= 2) cells[2] else NA_character_
+    home_raw     <- if (length(cells) >= 3) cells[3] else NA_character_
+    result_val   <- if (length(cells) >= 4) cells[4] else NA_character_
+    location_val <- if (length(cells) >= 5) cells[5] else NA_character_
+
+    if (is.na(date_val) || date_val == "" || !str_detect(date_val, "\\d{1,2}/\\d{1,2}/\\d{4}")) {
+      return(NULL)
+    }
+
+    tibble(
+      date         = date_val,
+      away_raw     = away_raw,
+      home_raw     = home_raw,
+      result       = result_val,
+      location     = location_val,
+      boxscore_url = boxscore_url
+    )
+  })
+
+  row_data %>%
+    compact() %>%
+    bind_rows()
+}
+```
+
+### `parse_team_score()`
+
+Splits a combined cell like `"Hamline 4"` into a team name and an integer score. Handles cancelled/postponed games where no score is present.
+
+```{r fn-parse-team-score}
+parse_team_score <- function(raw_text) {
+  if (is.na(raw_text) || raw_text == "") {
+    return(list(team = NA_character_, score = NA_integer_))
+  }
+
+  # The calendar cells contain multi-line text with embedded "(Away)"/"(Home)"
+  # role labels and lots of whitespace. Collapse and clean before matching.
+  cleaned <- raw_text %>%
+    str_replace_all("\\s*\\(Away\\)|\\s*\\(Home\\)", "") %>%  # strip role labels
+    str_replace_all("[\\r\\n\\t]+", " ") %>%                  # collapse line breaks
+    str_squish()                                               # normalise whitespace
+
+  # Match the last number in the string as the score
+  # e.g., "Massachusetts Institute of Technology 1" -> team + score
+  # e.g., "Saint Mary's" (cancelled) -> team only
+  match <- str_match(cleaned, "^(.+?)\\s+(\\d+)$")
+
+  if (is.na(match[1, 1])) {
+    return(list(team = str_trim(cleaned), score = NA_integer_))
+  }
+
+  list(
+    team  = str_trim(match[1, 2]),
+    score = as.integer(match[1, 3])
+  )
+}
+```
+
+### `scrape_boxscore()`
+
+Scrapes a single box score page and extracts runs (from the linescore table) and starting pitcher info (from the pitching tables). Returns a single-row tibble with NA values on failure rather than crashing.
+
+```{r fn-scrape-boxscore}
+scrape_boxscore <- function(url) {
+  na_row <- tibble(
+    boxscore_url    = url,
+    away_runs       = NA_integer_,
+    home_runs       = NA_integer_,
+    away_starter    = NA_character_,
+    home_starter    = NA_character_,
+    away_starter_ip = NA_character_,
+    home_starter_ip = NA_character_
+  )
+
+  if (is.na(url) || url == "") return(na_row)
+
+  pg <- tryCatch(read_html(url), error = function(e) NULL)
+  if (is.null(pg)) {
+    message("  [WARN] Could not load box score: ", url)
+    return(na_row)
+  }
+
+  tbls <- tryCatch(pg %>% html_table(fill = TRUE), error = function(e) list())
+  if (length(tbls) == 0) return(na_row)
+
+  # --- LINESCORE: first table with an "R" (runs) column ---
+  ls_idx    <- which(sapply(tbls, function(x) "R" %in% names(x)))
+  away_runs <- NA_integer_
+  home_runs <- NA_integer_
+
+  if (length(ls_idx) > 0) {
+    linescore <- tbls[[ls_idx[1]]]
+    if (nrow(linescore) >= 2 && "R" %in% names(linescore)) {
+      away_runs <- suppressWarnings(as.integer(linescore$R[1]))
+      home_runs <- suppressWarnings(as.integer(linescore$R[2]))
+    }
+  }
+
+  # --- PITCHING: tables with an "IP" column (away first, home second) ---
+  pitching_tbls   <- tbls[sapply(tbls, function(x) "IP" %in% names(x))]
+  away_starter    <- NA_character_
+  home_starter    <- NA_character_
+  away_starter_ip <- NA_character_
+  home_starter_ip <- NA_character_
+
+  find_player_col <- function(tbl) {
+    col_names  <- names(tbl)
+    player_col <- col_names[str_detect(col_names, regex("player|name", ignore_case = TRUE))]
+    if (length(player_col) > 0) return(player_col[1])
+    col_names[1]
+  }
+
+  if (length(pitching_tbls) >= 1) {
+    pt1 <- pitching_tbls[[1]] %>%
+      filter(!str_detect(.data[[find_player_col(pitching_tbls[[1]])]], regex("total|team", ignore_case = TRUE)))
+    if (nrow(pt1) >= 1) {
+      away_starter    <- as.character(pt1[[find_player_col(pt1)]][1])
+      away_starter_ip <- as.character(pt1[["IP"]][1])
+    }
+  }
+
+  if (length(pitching_tbls) >= 2) {
+    pt2 <- pitching_tbls[[2]] %>%
+      filter(!str_detect(.data[[find_player_col(pitching_tbls[[2]])]], regex("total|team", ignore_case = TRUE)))
+    if (nrow(pt2) >= 1) {
+      home_starter    <- as.character(pt2[[find_player_col(pt2)]][1])
+      home_starter_ip <- as.character(pt2[["IP"]][1])
+    }
+  }
+
+  tibble(
+    boxscore_url    = url,
+    away_runs       = away_runs,
+    home_runs       = home_runs,
+    away_starter    = away_starter,
+    home_starter    = home_starter,
+    away_starter_ip = away_starter_ip,
+    home_starter_ip = home_starter_ip
+  )
+}
+```
+
+### `scrape_stats()`
+
+Scrapes the MIAC cumulative stats page for a given year. Identifies tables by **column patterns** (not fixed indices) for robustness against layout changes. Returns a named list of tibbles for team batting, team pitching, team fielding, individual batting, and individual pitching.
+
+```{r fn-scrape-stats}
+scrape_stats <- function(year) {
+  url <- paste0(BASE_URL, "/stats.aspx?path=baseball&year=", year)
+
+  page <- tryCatch(read_html(url), error = function(e) {
+    stop("Could not load stats page: ", e$message)
+  })
+
+  tbls <- page %>% html_table(fill = TRUE)
+  message("  [INFO] Found ", length(tbls), " tables on stats page.")
+
+  is_batting_table <- function(tbl) {
+    cols <- toupper(names(tbl))
+    all(c("AVG") %in% cols) && any(c("AB", "R", "H") %in% cols)
+  }
+
+  is_pitching_table <- function(tbl) {
+    cols <- toupper(names(tbl))
+    any(c("ERA") %in% cols) && any(c("IP", "W-L") %in% cols)
+  }
+
+  is_fielding_table <- function(tbl) {
+    cols <- toupper(names(tbl))
+    any(c("FLD%") %in% cols) && any(c("PO", "A", "E") %in% cols)
+  }
+
+  has_player_column <- function(tbl) {
+    any(str_detect(toupper(names(tbl)), "PLAYER|NAME"))
+  }
+
+  team_batting_list   <- list()
+  team_pitching_list  <- list()
+  team_fielding_list  <- list()
+  indiv_batting_list  <- list()
+  indiv_pitching_list <- list()
+
+  for (i in seq_along(tbls)) {
+    tbl <- tbls[[i]]
+    if (ncol(tbl) < 3 || nrow(tbl) < 2) next
+
+    # Check batting BEFORE fielding: the team batting table includes PO/A/E/FLD%
+    # columns, so is_fielding_table() would match it first and misclassify it.
+    if (is_batting_table(tbl)) {
+      if (has_player_column(tbl)) {
+        indiv_batting_list <- append(indiv_batting_list, list(tbl))
+      } else {
+        team_batting_list <- append(team_batting_list, list(tbl))
+      }
+    } else if (is_pitching_table(tbl)) {
+      if (has_player_column(tbl)) {
+        indiv_pitching_list <- append(indiv_pitching_list, list(tbl))
+      } else {
+        team_pitching_list <- append(team_pitching_list, list(tbl))
+      }
+    } else if (is_fielding_table(tbl)) {
+      if (!has_player_column(tbl)) {
+        team_fielding_list <- append(team_fielding_list, list(tbl))
+      }
+    }
+  }
+
+  pick_first <- function(lst, label) {
+    if (length(lst) > 0) {
+      message("  [INFO] Found ", length(lst), " candidate(s) for ", label, "; using first.")
+      return(lst[[1]])
+    }
+    message("  [WARN] No table found for ", label)
+    return(tibble())
+  }
+
+  list(
+    team_batting        = pick_first(team_batting_list,   "team_batting"),
+    team_pitching       = pick_first(team_pitching_list,  "team_pitching"),
+    team_fielding       = pick_first(team_fielding_list,  "team_fielding"),
+    individual_batting  = pick_first(indiv_batting_list,  "individual_batting"),
+    individual_pitching = pick_first(indiv_pitching_list, "individual_pitching")
+  )
+}
+```
+
+### `clean_games_table()`
+
+Cleans the raw games data frame by:
+
+- Parsing team names and scores from the combined raw cells
+- Converting date strings to `Date` objects and extracting day of week
+- Flagging conference games (location contains `"(Conf.)"`)
+- Normalizing the result status to `Final`, `Cancelled`, or `Postponed`
+- Determining the winner of each completed game
+
+```{r fn-clean-games-table}
+clean_games_table <- function(df) {
+  if (nrow(df) == 0) return(df)
+
+  away_parsed <- map(df$away_raw, parse_team_score)
+  home_parsed <- map(df$home_raw, parse_team_score)
+
+  df <- df %>%
+    mutate(
+      away_team  = map_chr(away_parsed, ~ .x$team),
+      away_score = map_int(away_parsed, ~ .x$score),
+      home_team  = map_chr(home_parsed, ~ .x$team),
+      home_score = map_int(home_parsed, ~ .x$score),
+
+      date_clean  = str_extract(date, "\\d{1,2}/\\d{1,2}/\\d{4}"),
+      game_date   = as.Date(date_clean, format = "%m/%d/%Y"),
+      day_of_week = weekdays(game_date),
+
+      is_conference = str_detect(location, fixed("(Conf.)")),
+
+      status = case_when(
+        str_detect(result, regex("final",     ignore_case = TRUE)) ~ "Final",
+        str_detect(result, regex("cancelled", ignore_case = TRUE)) ~ "Cancelled",
+        str_detect(result, regex("postponed", ignore_case = TRUE)) ~ "Postponed",
+        TRUE ~ result
+      ),
+
+      winner = case_when(
+        is.na(away_score) | is.na(home_score) ~ NA_character_,
+        away_score > home_score               ~ away_team,
+        home_score > away_score               ~ home_team,
+        TRUE                                  ~ "Tie"
+      )
+    ) %>%
+    select(
+      game_date, day_of_week, away_team, away_score, home_team, home_score,
+      status, result, winner, is_conference, location, boxscore_url,
+      everything(), -date_clean, -away_raw, -home_raw, -date
+    )
+
+  df
+}
+```
+
+---
+
+## Step 1: Scrape the Composite Schedule
+
+The MIAC composite schedule is not paginated by month — every month URL returns the identical full-season schedule (Feb 14 – May 5, 2026). Because each call now spins up a headless Chrome browser, looping all 12 months would waste ~12 browser launches for duplicate data. Instead, we scrape the base calendar URL once and get everything in a single pass.
+
+```{r step1-scrape-schedule}
+cat("Scraping composite schedule...\n")
+
+games_raw <- scrape_calendar_month(YEAR, month = 2)  # month=2 covers full season; any value works
+
+if (is.null(games_raw) || nrow(games_raw) == 0) {
+  stop("No games were returned. Check that Chrome is installed and chromote is working.")
+}
+
+cat("Total unique games found:", nrow(games_raw), "\n")
+head(games_raw)
+```
+
+---
+
+## Step 2: Clean the Games Table
+
+```{r step2-clean-games}
+games_clean <- clean_games_table(games_raw)
+cat("Games after cleaning:", nrow(games_clean), "\n")
+head(games_clean)
+```
+
+---
+
+## Step 3: Scrape Box Scores
+
+Only scrape completed games that have a box score URL.
+
+```{r step3-scrape-boxscores}
+urls_to_scrape <- games_clean %>%
+  filter(!is.na(boxscore_url), status == "Final") %>%
+  pull(boxscore_url) %>%
+  unique()
+
+cat("Box scores to scrape:", length(urls_to_scrape), "\n")
+
+boxscores <- map_dfr(seq_along(urls_to_scrape), function(i) {
+  if (i %% 10 == 0 || i == 1) {
+    cat("  -> Scraping box score", i, "of", length(urls_to_scrape), "...\n")
+  }
+  result <- tryCatch(
+    scrape_boxscore(urls_to_scrape[i]),
+    error = function(e) {
+      message("  [ERROR] Box score ", i, ": ", e$message)
+      tibble(
+        boxscore_url    = urls_to_scrape[i],
+        away_runs       = NA_integer_,
+        home_runs       = NA_integer_,
+        away_starter    = NA_character_,
+        home_starter    = NA_character_,
+        away_starter_ip = NA_character_,
+        home_starter_ip = NA_character_
+      )
+    }
+  )
+  Sys.sleep(0.5)  # Be polite
+  result
+})
+
+cat("Box scores scraped:", nrow(boxscores), "\n")
+head(boxscores)
+```
+
+---
+
+## Step 4: Scrape Cumulative Stats
+
+```{r step4-scrape-stats}
+cat("Scraping cumulative stats...\n")
+stats <- scrape_stats(YEAR)
+
+team_batting        <- stats$team_batting
+team_pitching       <- stats$team_pitching
+team_fielding       <- stats$team_fielding
+individual_batting  <- stats$individual_batting
+individual_pitching <- stats$individual_pitching
+
+cat("Team batting rows:       ", nrow(team_batting), "\n")
+cat("Team pitching rows:      ", nrow(team_pitching), "\n")
+cat("Team fielding rows:      ", nrow(team_fielding), "\n")
+cat("Individual batting rows: ", nrow(individual_batting), "\n")
+cat("Individual pitching rows:", nrow(individual_pitching), "\n")
+```
+
+---
+
+## Step 5: Merge and Save CSVs
+
+```{r step5-merge-save}
+# Merge games with box score data
+games_full <- games_clean %>%
+  left_join(boxscores, by = "boxscore_url")
+
+# Save all CSVs
+write.csv(team_batting,        "team_batting_2026.csv",        row.names = FALSE)
+write.csv(team_pitching,       "team_pitching_2026.csv",       row.names = FALSE)
+write.csv(team_fielding,       "team_fielding_2026.csv",       row.names = FALSE)
+write.csv(individual_batting,  "individual_batting_2026.csv",  row.names = FALSE)
+write.csv(individual_pitching, "individual_pitching_2026.csv", row.names = FALSE)
+write.csv(games_clean,         "miac_games_2026.csv",          row.names = FALSE)
+write.csv(boxscores,           "miac_boxscores_2026.csv",      row.names = FALSE)
+write.csv(games_full,          "miac_games_full_2026.csv",     row.names = FALSE)
+
+cat("All CSVs saved:\n")
+cat("  - team_batting_2026.csv\n")
+cat("  - team_pitching_2026.csv\n")
+cat("  - team_fielding_2026.csv\n")
+cat("  - individual_batting_2026.csv\n")
+cat("  - individual_pitching_2026.csv\n")
+cat("  - miac_games_2026.csv\n")
+cat("  - miac_boxscores_2026.csv\n")
+cat("  - miac_games_full_2026.csv\n")
+```
+
+---
+
+## Sanity Check
+
+```{r sanity-check}
+cat("games_full rows:", nrow(games_full), "\n")
+head(games_full)
+
+cat("\nteam_batting rows:", nrow(team_batting), "\n")
+head(team_batting)
+
+cat("\nindividual_pitching rows:", nrow(individual_pitching), "\n")
+head(individual_pitching)
+```
